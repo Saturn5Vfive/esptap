@@ -42,6 +42,7 @@ class DNSServer
     DNSServer();
     void processNextRequest();
     void setErrorReplyCode(const DNSReplyCode &replyCode);
+    void setLoggingMode(bool loggingMode);
     void setTTL(const uint32_t &ttl);
 
     // Returns true if successful, false if there are no sockets available
@@ -60,6 +61,7 @@ class DNSServer
     int _currentPacketSize;
     unsigned char* _buffer;
     DNSHeader* _dnsHeader;
+    bool _dnsLogging = true;
     uint32_t _ttl;
     DNSReplyCode _errorReplyCode;
 

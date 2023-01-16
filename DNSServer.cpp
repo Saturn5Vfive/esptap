@@ -24,6 +24,10 @@ bool DNSServer::start(const uint16_t &port, const String &domainName,
   return _udp.begin(_port) == 1;
 }
 
+void DNSServer::setLoggingMode(bool loggingMode){
+  _dnsLogging = loggingMode;
+}
+
 void DNSServer::setErrorReplyCode(const DNSReplyCode &replyCode)
 {
   _errorReplyCode = replyCode;
@@ -149,11 +153,10 @@ void DNSServer::replyWithSpoofedIP()
   _udp.endPacket();
 
 
-
-  #ifdef DEBUG
-    DEBUG_OUTPUT.print("Recieved DNS Query:");
+  if(_dnsLogging){
+    DEBUG_OUTPUT.print("Recieved DNS Query (spoofing remote addr):");
     DEBUG_OUTPUT.println(getDomainNameWithoutWwwPrefix());
-  #endif
+  }
 }
 
 
@@ -186,10 +189,10 @@ void DNSServer::replyWithIP()
 
 
 
-  #ifdef DEBUG
+  if(_dnsLogging){
     DEBUG_OUTPUT.print("Recieved DNS Query:");
     DEBUG_OUTPUT.println(getDomainNameWithoutWwwPrefix());
-  #endif
+  }
 }
 
 void DNSServer::replyWithCustomCode()

